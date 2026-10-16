@@ -1,0 +1,92 @@
+name: ZIP 9 PR CPU verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: 70f72e9cfdbfc570846ca363ead2135394af3e9a
+          persist-credentials: false
+      - name: Verify exact PR revision
+        run: |
+          set -euo pipefail
+          expected=70f72e9cfdbfc570846ca363ead2135394af3e9a
+          actual=$(git rev-parse HEAD)
+          test -n "$actual"
+          test "$actual" = "$expected"
+          printf 'Verified PR revision: %s\n' "$actual"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Resolve fresh dependencies
+        id: resolve
+        run: |
+          set -euo pipefail
+          test ! -f Cargo.lock
+          cargo generate-lockfile
+          cargo tree --locked -p candle-core --depth 1 | tee dependencies.log
+          rustc --version --verbose
+          cargo --version
+      - name: Run all four ZIP 9 regression tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p candle-core --test serialization_tests zip9_ 2>&1 | tee zip9-tests.log
+          python3 - <<'PY'
+          import pathlib
+          import re
+          text = pathlib.Path('zip9-tests.log').read_text()
+          expected = {
+              'zip9_npz_borrowed_utf8_names',
+              'zip9_npz_owned_cp437_names',
+              'zip9_invalid_npz_returns_zip_errors',
+              'zip9_invalid_pth_returns_zip_error',
+          }
+          passed = re.findall(r'^test (\S+) \.\.\. ok$', text, re.MULTILINE)
+          assert len(passed) == len(expected) and set(passed) == expected, passed
+          assert re.search(r'^test result: ok\. 4 passed; 0 failed; 0 ignored;', text, re.MULTILINE)
+          print(f'ZIP 9 regression census: expected {len(expected)}, passed {len(passed)}')
+          PY
+      - name: Run CPU core test suite
+        run: |
+          set -euo pipefail
+          cargo test --locked -p candle-core --lib --bins --tests 2>&1 | tee core-tests.log
+          python3 - <<'PY'
+          import pathlib
+          import re
+          text = pathlib.Path('core-tests.log').read_text()
+          rows = re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text, re.MULTILINE)
+          assert rows and all(int(failed) == 0 for _, failed, _ in rows), rows
+          passed = sum(int(count) for count, _, _ in rows)
+          named = re.findall(r'^test .+ \.\.\. ok$', text, re.MULTILINE)
+          assert passed == len(named) and passed >= 200, (passed, len(named))
+          ignored = sum(int(count) for _, _, count in rows)
+          print(f'CPU core census: expected at least 200, passed {passed}, ignored {ignored}')
+          PY
+      - name: Check CPU consumers
+        run: cargo check --locked -p candle-nn -p candle-transformers --all-targets
+      - name: Preserve resolved dependencies and test evidence
+        if: always() && steps.resolve.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: candle-zip9-cpu-evidence
+          path: |
+            Cargo.lock
+            dependencies.log
+            zip9-tests.log
+            core-tests.log
+          if-no-files-found: error
+          retention-days: 14
